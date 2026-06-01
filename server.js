@@ -2,9 +2,12 @@ require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
 const https = require('https');
-const http = require('http'); // dùng cho tự ping
+const http = require('http');
 const winston = require('winston');
 
+// ======================
+// CONFIG
+// ======================
 const CONFIG = {
     BASE_URL: process.env.BASE_URL || 'https://aibcr.me',
     USERNAME: process.env.AUTH_USER || 'tiendatoce1232',
@@ -12,6 +15,8 @@ const CONFIG = {
     PORT: process.env.PORT || 5000,
     FETCH_INTERVAL: 2000,
     SELF_PING_INTERVAL: 60_000, // 1 phút
+    // Public URL ưu tiên
+    PUBLIC_URL: process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || process.env.APP_URL || null,
 };
 
 const logger = winston.createLogger({
@@ -169,7 +174,7 @@ class BaccaratFetcher {
 }
 
 // ======================
-// BaccaratPredictor (thêm SuperVIP)
+// BaccaratPredictor (nâng cấp Super VIP)
 // ======================
 class BaccaratPredictor {
     constructor() {
@@ -248,56 +253,116 @@ class BaccaratPredictor {
     }
 
     // ======================
-    // Super VIP Algorithm
+    // Super VIP 2.0
     // ======================
     predictSuperVIP(table) {
         const hist = this.getHistory(table);
-
-        if (hist.length < 10) {
-            // fallback về standard khi quá ít dữ liệu
-            return this.predictStandard(table);
-        }
+        if (hist.length < 5) return this.predictVIP(table); // fallback sớm
 
         const score = { B: 0, P: 0 };
+        const reasons = [];
 
-        // 1. Tần suất gần đây (20 kết quả cuối)
-        const recent = hist.slice(-20);
-        const bCount = recent.filter(x => x === 'B').length;
-        const pCount = recent.filter(x => x === 'P').length;
-        if (bCount > pCount) score.B += 20;
-        if (pCount > bCount) score.P += 20;
-
-        // 2. Markov bậc 3
-        if (hist.length >= 4) {
-            const pattern = hist.slice(-3).join('');
-            const nexts = { B: 0, P: 0 };
-            for (let i = 0; i < hist.length - 3; i++) {
-                const p = hist.slice(i, i + 3).join('');
-                if (p === pattern) {
-                    const next = hist[i + 3];
-                    if (next === 'B') nexts.B++;
-                    if (next === 'P') nexts.P++;
-                }
-            }
-            if (nexts.B > nexts.P) score.B += 40;
-            if (nexts.P > nexts.B) score.P += 40;
+        // 1. Tần suất 20 kết quả gần nhất (ưu tiên xu hướng ngắn hạn)
+        const recentWindow = hist.slice(-20);
+        const bRecent = recentWindow.filter(x => x === 'B').length;
+        const pRecent = recentWindow.filter(x => x === 'P').length;
+        const recentTotal = bRecent + pRecent || 1;
+        if (bRecent > pRecent) {
+            score.B += 20;
+            reasons.push(`Gần đây B nhiều hơn (${bRecent}/${recentTotal})`);
+        } else if (pRecent > bRecent) {
+            score.P += 20;
+            reasons.push(`Gần đây P nhiều hơn (${pRecent}/${recentTotal})`);
         }
 
-        // 3. PingPong (BPBP / PBPB)
-        const last4 = hist.slice(-4).join('');
-        if (last4 === 'BPBP') score.B += 30;
-        if (last4 === 'PBPB') score.P += 30;
+        // 2. Markov bậc 3 (pattern 3 kết quả cuối)
+        if (hist.length >= 4) {
+            const last3 = hist.slice(-3).join('');
+            const nextCount = { B: 0, P: 0 };
+            for (let i = 0; i < hist.length - 3; i++) {
+                const pattern = hist.slice(i, i + 3).join('');
+                if (pattern === last3) {
+                    const next = hist[i + 3];
+                    if (next === 'B') nextCount.B++;
+                    else if (next === 'P') nextCount.P++;
+                }
+            }
+            if (nextCount.B > nextCount.P) {
+                score.B += 35;
+                reasons.push(`Markov3: ${last3} → B (${nextCount.B} vs ${nextCount.P})`);
+            } else if (nextCount.P > nextCount.B) {
+                score.P += 35;
+                reasons.push(`Markov3: ${last3} → P (${nextCount.P} vs ${nextCount.B})`);
+            }
+        }
 
-        // 4. Bệt (streak >= 4 đảo chiều)
-        const last = hist[hist.length - 1];
+        // 3. Markov bậc 4 (nếu đủ dữ liệu)
+        if (hist.length >= 5) {
+            const last4 = hist.slice(-4).join('');
+            const nextCount = { B: 0, P: 0 };
+            for (let i = 0; i < hist.length - 4; i++) {
+                const pattern = hist.slice(i, i + 4).join('');
+                if (pattern === last4) {
+                    const next = hist[i + 4];
+                    if (next === 'B') nextCount.B++;
+                    else if (next === 'P') nextCount.P++;
+                }
+            }
+            if (nextCount.B > nextCount.P) {
+                score.B += 25;
+                reasons.push(`Markov4: ${last4} → B`);
+            } else if (nextCount.P > nextCount.B) {
+                score.P += 25;
+                reasons.push(`Markov4: ${last4} → P`);
+            }
+        }
+
+        // 4. Phát hiện cầu đặc biệt
+        const lastFew = hist.slice(-6).join(''); // 6 kết quả cuối
+
+        // Cầu bệt (streak >= 4) -> dự đoán đảo chiều
+        const lastResult = hist[hist.length - 1];
         let streak = 1;
         for (let i = hist.length - 2; i >= 0; i--) {
-            if (hist[i] === last) streak++;
+            if (hist[i] === lastResult) streak++;
             else break;
         }
         if (streak >= 4) {
-            if (last === 'B') score.P += 25;
-            if (last === 'P') score.B += 25;
+            const reverse = lastResult === 'B' ? 'P' : 'B';
+            score[reverse] += 30;
+            reasons.push(`Bệt ${streak} ${lastResult}, dự đoán đảo chiều ${reverse}`);
+        }
+
+        // Cầu xen kẽ (BPBP hoặc PBPB)
+        if (lastFew === 'BPBPBP' || lastFew === 'PBPBPB') {
+            const next = lastFew.endsWith('B') ? 'P' : 'B';
+            score[next] += 20;
+            reasons.push(`Cầu xen kẽ, tiếp tục ${next}`);
+        }
+
+        // Cầu 2-2 (BBPPBB hoặc PPBBPP)
+        if (lastFew === 'BBPPBB' || lastFew === 'PPBBPP') {
+            const next = lastFew.endsWith('B') ? 'P' : 'B';
+            score[next] += 25;
+            reasons.push(`Cầu 2-2, dự đoán ${next}`);
+        }
+
+        // Cầu 3-1 (BBB P BBB hoặc PPP B PPP)
+        if (/(BBB)(P)(BBB)/.test(lastFew) || /(PPP)(B)(PPP)/.test(lastFew)) {
+            const next = lastFew.endsWith('B') ? 'B' : 'P'; // tiếp tục xu hướng 3
+            score[next] += 25;
+            reasons.push(`Cầu 3-1, tiếp tục ${next}`);
+        }
+
+        // Cầu nghiêng dài hạn (toàn bộ lịch sử)
+        const totalB = hist.filter(x => x === 'B').length;
+        const totalP = hist.filter(x => x === 'P').length;
+        if (totalB > totalP * 1.1) {
+            score.B += 10;
+            reasons.push('Xu hướng dài hạn nghiêng B');
+        } else if (totalP > totalB * 1.1) {
+            score.P += 10;
+            reasons.push('Xu hướng dài hạn nghiêng P');
         }
 
         const prediction = score.B >= score.P ? 'B' : 'P';
@@ -308,13 +373,13 @@ class BaccaratPredictor {
             prediction,
             confidence,
             score,
-            reason: `SuperVIP (Markov3 + tần suất + pingpong + bệt)`,
+            reason: reasons.join('; ') || 'Không có tín hiệu rõ ràng',
         };
     }
 }
 
 // ======================
-// API Server (thêm endpoint SuperVIP & tự ping)
+// API Server (thêm endpoint /ping & giữ nguyên các endpoint khác)
 // ======================
 function createApp(predictor) {
     const app = express();
@@ -323,6 +388,11 @@ function createApp(predictor) {
         res.header('Access-Control-Allow-Origin', '*');
         res.header('Access-Control-Allow-Headers', '*');
         next();
+    });
+
+    // Health check
+    app.get('/ping', (req, res) => {
+        res.json({ status: 'ok', timestamp: new Date().toISOString() });
     });
 
     // Dữ liệu thô
@@ -355,7 +425,7 @@ function createApp(predictor) {
         res.json({ success: true, data: predictions, lastUpdate: predictor.lastUpdate });
     });
 
-    // Dự đoán VIP (Markov bậc 2)
+    // Dự đoán VIP
     app.get('/dudoan/vip', (req, res) => {
         const tables = predictor.getAllTables();
         const predictions = tables.map(table => ({
@@ -365,7 +435,7 @@ function createApp(predictor) {
         res.json({ success: true, data: predictions, lastUpdate: predictor.lastUpdate });
     });
 
-    // Dự đoán Super VIP (Markov bậc 3 + heuristic)
+    // Dự đoán Super VIP
     app.get('/dudoan/supervip', (req, res) => {
         const tables = predictor.getAllTables();
         const predictions = tables.map(table => ({
@@ -383,12 +453,7 @@ function createApp(predictor) {
         const supervip = predictor.predictSuperVIP(table);
         res.json({
             success: true,
-            data: {
-                table,
-                standard,
-                vip,
-                supervip,
-            },
+            data: { table, standard, vip, supervip },
         });
     });
 
@@ -396,19 +461,30 @@ function createApp(predictor) {
 }
 
 // ======================
-// Self-ping helper
+// Tự động lấy URL public & ping
 // ======================
+function getPublicUrl(port) {
+    if (CONFIG.PUBLIC_URL) {
+        // Đảm bảo không có trailing slash
+        return CONFIG.PUBLIC_URL.replace(/\/+$/, '');
+    }
+    // Fallback: localhost
+    return `http://localhost:${port}`;
+}
+
 function startSelfPing(port) {
-    const url = `http://127.0.0.1:${port}/api/baccarat`;
+    const publicUrl = getPublicUrl(port);
+    const pingEndpoint = `${publicUrl}/ping`;
+    logger.info(`🔄 Tự ping mỗi ${CONFIG.SELF_PING_INTERVAL / 1000}s tới ${pingEndpoint}`);
+
     setInterval(() => {
-        http.get(url, (res) => {
-            // Chỉ cần request thành công, không cần xử lý data
-            res.resume();
+        const client = pingEndpoint.startsWith('https') ? https : http;
+        client.get(pingEndpoint, (res) => {
+            res.resume(); // Tiêu thụ dữ liệu để giải phóng bộ nhớ
         }).on('error', (e) => {
-            logger.warn(`Self-ping failed: ${e.message}`);
+            logger.warn(`Self-ping thất bại: ${e.message}`);
         });
     }, CONFIG.SELF_PING_INTERVAL);
-    logger.info(`🔄 Tự ping mỗi ${CONFIG.SELF_PING_INTERVAL / 1000}s để duy trì hoạt động`);
 }
 
 // ======================
@@ -456,15 +532,16 @@ async function start() {
     const app = createApp(predictor);
     const server = app.listen(CONFIG.PORT, '0.0.0.0', () => {
         logger.info(`🚀 API đang chạy tại http://localhost:${CONFIG.PORT}`);
+        logger.info(`   /ping                 - Health check`);
         logger.info(`   /dudoan               - Dự đoán tiêu chuẩn`);
         logger.info(`   /dudoan/vip           - Dự đoán VIP (Markov bậc 2)`);
-        logger.info(`   /dudoan/supervip      - Dự đoán Siêu VIP (Markov bậc 3 + heuristic)`);
+        logger.info(`   /dudoan/supervip      - Dự đoán Siêu VIP (Markov bậc 3+4, cầu đặc biệt)`);
         logger.info(`   /dudoan/:table        - Dự đoán cả 3 loại cho một bàn`);
         logger.info(`   /api/baccarat         - Dữ liệu thô`);
         logger.info(`⏰ Tự động cập nhật mỗi ${CONFIG.FETCH_INTERVAL / 1000}s`);
     });
 
-    // Tự ping để không bị sleep (nếu chạy trên nền tảng miễn phí như Render, Heroku)
+    // Tự ping để duy trì hoạt động (chống sleep)
     startSelfPing(CONFIG.PORT);
 }
 
